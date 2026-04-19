@@ -1,0 +1,9 @@
+# Python cache files
+__pycache__/
+*.pyc
+
+# virtual env
+venv
+.venv
+image-processing/videos
+image-processing/outputs/hough_transform/all_frames
