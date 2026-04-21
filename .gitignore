@@ -7,3 +7,4 @@ venv
 .venv
 image-processing/videos
 image-processing/outputs/hough_transform/all_frames
+image-processing/outputs/hough/
