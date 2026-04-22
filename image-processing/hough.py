@@ -5,16 +5,15 @@ import numpy as np
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-INPUT_VIDEO = os.path.join(BASE_DIR, "videos", "PXL_20250325_045117252.TS.mp4")
+INPUT_VIDEO = os.path.join(BASE_DIR, "videos", "PXL_20250325_043754655.TS.mp4")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs", "hough")
-OUTPUT_VIDEO = os.path.join(OUTPUT_DIR, "PXL_20250325_045117252.TS.mp4")
-DEBUG_VIDEO = os.path.join(OUTPUT_DIR, "PXL_20250325_045117252.TS_debug.mp4")
+OUTPUT_VIDEO = os.path.join(OUTPUT_DIR, "PXL_20250325_043754655.TS.mp4")
+DEBUG_VIDEO = os.path.join(OUTPUT_DIR, "PXL_20250325_043754655.TS_debug.mp4")
 MAX_FRAMES = None
 
-PREV_BOUNDARY_LINE = None
-PREV_PATH_LINE = None
+PREV_LEFT_LINE = None
+PREV_RIGHT_LINE = None
 SMOOTHING_ALPHA = 0.2
-PATH_OFFSET_PIXELS = 220
 
 
 def canny(image):
@@ -27,10 +26,10 @@ def capture_region_of_interest(image):
     height, width = image.shape[:2]
     polygon = np.array(
         [
-            (int(0.10 * width), height - 1),
+            (int(0.05 * width), height - 1),
             (int(0.95 * width), height - 1),
-            (int(0.72 * width), int(0.62 * height)),
-            (int(0.38 * width), int(0.62 * height)),
+            (int(0.78 * width), int(0.60 * height)),
+            (int(0.22 * width), int(0.60 * height)),
         ],
         dtype=np.int32,
     )
@@ -59,12 +58,13 @@ def calculate_coordinates(image, params):
 
 def average_slope_intercept(image, lines):
     if lines is None:
-        return None
+        return None, None
 
     height, width = image.shape[:2]
     center_x = width / 2.0
 
-    boundary_lines = []
+    left_lines = []
+    right_lines = []
 
     for line in lines:
         x1, y1, x2, y2 = line.reshape(4)
@@ -77,37 +77,37 @@ def average_slope_intercept(image, lines):
         x_mid = (x1 + x2) / 2.0
         y_mid = (y1 + y2) / 2.0
 
-        if length < 40:
+        if length < 35:
             continue
 
-        if abs(slope) < 0.35 or abs(slope) > 2.5:
+        if abs(slope) < 0.15 or abs(slope) > 3.0:
             continue
 
-        # Prefer right-side boundary candidates only
-        if x_mid < center_x:
+        if y_mid < 0.50 * height:
             continue
 
-        # Prefer lines in lower half of the road area
-        if y_mid < 0.55 * height:
-            continue
+        weight = length * (1.0 + (y_mid / height))
 
-        # Score candidates so stronger and more right-side lines dominate
-        right_bias = x_mid / width
-        weight = length * (1.0 + right_bias)
+        if x_mid < center_x and slope < 0:
+            left_lines.append((float(slope), float(intercept), float(weight)))
 
-        boundary_lines.append((float(slope), float(intercept), float(weight)))
+        elif x_mid > center_x and slope > 0:
+            right_lines.append((float(slope), float(intercept), float(weight)))
 
-    if not boundary_lines:
-        return None
+    left_line = None
+    right_line = None
 
-    boundary_array = np.array(boundary_lines, dtype=np.float64)
-    boundary_avg = np.average(boundary_array[:, :2], axis=0, weights=boundary_array[:, 2])
+    if left_lines:
+        left_array = np.array(left_lines, dtype=np.float64)
+        left_avg = np.average(left_array[:, :2], axis=0, weights=left_array[:, 2])
+        left_line = calculate_coordinates(image, left_avg)
 
-    boundary_coords = calculate_coordinates(image, boundary_avg)
-    if boundary_coords is None:
-        return None
+    if right_lines:
+        right_array = np.array(right_lines, dtype=np.float64)
+        right_avg = np.average(right_array[:, :2], axis=0, weights=right_array[:, 2])
+        right_line = calculate_coordinates(image, right_avg)
 
-    return np.array([boundary_coords], dtype=np.int32)
+    return left_line, right_line
 
 
 def cosine_distance(a, b):
@@ -123,7 +123,7 @@ def cosine_distance(a, b):
 
 def smooth_line(current_line, previous_line, alpha):
     if current_line is None:
-        return previous_line
+        return None
     if previous_line is None:
         return current_line
 
@@ -132,31 +132,6 @@ def smooth_line(current_line, previous_line, alpha):
 
     smoothed = alpha * current_line + (1.0 - alpha) * previous_line
     return smoothed.astype(np.int32)
-
-
-def create_path_line(boundary_line, offset_pixels):
-    if boundary_line is None:
-        return None
-
-    x1, y1, x2, y2 = boundary_line.astype(np.float64)
-
-    dx = x2 - x1
-    dy = y2 - y1
-    length = np.hypot(dx, dy)
-
-    if length < 1e-6:
-        return None
-
-    # Unit normal pointing inward from right boundary toward road center
-    nx = -dy / length
-    ny = dx / length
-
-    shifted_x1 = int(x1 + offset_pixels * nx)
-    shifted_y1 = int(y1 + offset_pixels * ny)
-    shifted_x2 = int(x2 + offset_pixels * nx)
-    shifted_y2 = int(y2 + offset_pixels * ny)
-
-    return np.array([shifted_x1, shifted_y1, shifted_x2, shifted_y2], dtype=np.int32)
 
 
 def display_lines(image, lines):
@@ -233,7 +208,6 @@ def create_debug_panel(original, canny_img, roi_mask, hough_preview, final_image
         cv2.LINE_AA,
     )
 
-    # Append final frame as a PiP thumbnail in the lower-right corner.
     pip_h = max(120, final_tile.shape[0] // 4)
     pip_w = max(200, final_tile.shape[1] // 4)
     pip = cv2.resize(final_tile, (pip_w, pip_h))
@@ -244,7 +218,7 @@ def create_debug_panel(original, canny_img, roi_mask, hough_preview, final_image
 
 
 def detect_lane(image):
-    global PREV_BOUNDARY_LINE, PREV_PATH_LINE
+    global PREV_LEFT_LINE, PREV_RIGHT_LINE
 
     canny_img = canny(image)
     roi_img, roi_mask = capture_region_of_interest(canny_img)
@@ -253,40 +227,38 @@ def detect_lane(image):
         roi_img,
         1,
         np.pi / 180,
-        45,
+        40,
         np.array([]),
-        minLineLength=35,
-        maxLineGap=90,
+        minLineLength=30,
+        maxLineGap=60,
     )
 
-    boundary_lines = average_slope_intercept(image, hough_lines)
+    left_line, right_line = average_slope_intercept(image, hough_lines)
 
-    boundary_line = None
-    if boundary_lines is not None and len(boundary_lines) > 0:
-        boundary_line = boundary_lines[0]
+    left_line = smooth_line(left_line, PREV_LEFT_LINE, SMOOTHING_ALPHA)
+    right_line = smooth_line(right_line, PREV_RIGHT_LINE, SMOOTHING_ALPHA)
 
-    boundary_line = smooth_line(boundary_line, PREV_BOUNDARY_LINE, SMOOTHING_ALPHA)
-    PREV_BOUNDARY_LINE = boundary_line
-
-    path_line = create_path_line(boundary_line, PATH_OFFSET_PIXELS)
-    path_line = smooth_line(path_line, PREV_PATH_LINE, SMOOTHING_ALPHA)
-    PREV_PATH_LINE = path_line
+    PREV_LEFT_LINE = left_line
+    PREV_RIGHT_LINE = right_line
 
     threshold = 1.0
-    if boundary_line is not None and path_line is not None:
-        boundary_vec = np.array(
-            [boundary_line[2] - boundary_line[0], boundary_line[3] - boundary_line[1]],
+    if left_line is not None and right_line is not None:
+        left_vec = np.array(
+            [left_line[2] - left_line[0], left_line[3] - left_line[1]],
             dtype=np.float64,
         )
-        path_vec = np.array(
-            [path_line[2] - path_line[0], path_line[3] - path_line[1]],
+        right_vec = np.array(
+            [right_line[2] - right_line[0], right_line[3] - right_line[1]],
             dtype=np.float64,
         )
-        threshold = cosine_distance(boundary_vec, path_vec)
+        threshold = cosine_distance(left_vec, right_vec)
 
     lines_to_draw = []
-    if boundary_line is not None:
-        lines_to_draw.append((boundary_line, (0, 255, 255), 5))   # boundary
+    if left_line is not None:
+        lines_to_draw.append((left_line, (0, 255, 255), 5))
+
+    if right_line is not None:
+        lines_to_draw.append((right_line, (0, 0, 255), 5))
 
     lane_marked = display_lines(image, lines_to_draw if lines_to_draw else None)
     hough_preview = _draw_raw_hough_lines(image, hough_lines)
