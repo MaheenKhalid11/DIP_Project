@@ -2,22 +2,32 @@ import cv2
 import time
 import re
 import numpy as np
-import pytesseract
 import argparse
 import sys
 from pathlib import Path
 from ultralytics import YOLO
 from collections import deque
+import pytesseract
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 from segmentation import color_segmentation
 
 
-model = YOLO("yolov8n.pt")
-CAR_ICON_PATH = Path("car.png")
+DEFAULT_COCO_MODEL_PATH = "yolov8n.pt"
+DEFAULT_BARRIER_MODEL_PATH = "boom_barrier_best.pt"
+
+
+def load_detection_model(weights_path):
+    weights_path = Path(weights_path).expanduser().resolve()
+    if not weights_path.exists():
+        raise FileNotFoundError(f"YOLO weights not found: {weights_path}")
+    return YOLO(str(weights_path))
+
+
+model = load_detection_model(DEFAULT_COCO_MODEL_PATH)
+barrier_model = load_detection_model(DEFAULT_BARRIER_MODEL_PATH)
+CAR_ICON_PATH = "car.png"
 CAR_ICON_IMAGE = cv2.imread(str(CAR_ICON_PATH), cv2.IMREAD_UNCHANGED)
 
 
@@ -210,6 +220,8 @@ def get_path_zone(frame_width, frame_height, lane_offset=0):
     return zone
 
 
+
+
 def detect_road_portion(frame_small):
     """
     Estimates drivable road region using adaptive color segmentation,
@@ -316,14 +328,50 @@ def estimate_risk(detection, car_zone_mask, danger_zone_mask, frame_width, frame
     return detection
 
 
-def process_obstacles(frame_small, results, car_zone_mask, danger_zone_mask):
+def extract_barrier_detections(frame_small, results, car_zone_mask, danger_zone_mask):
+    """
+    Converts detections from the dedicated barrier model into the same
+    obstacle dict format used by COCO detections.
+    """
+    sh, sw = frame_small.shape[:2]
+    detections = []
+    names = getattr(results[0], "names", {}) or getattr(barrier_model, "names", {})
+    single_class_barrier_model = len(names) == 1
+
+    for box in results[0].boxes:
+        cls_id = int(box.cls[0])
+        class_name = str(names.get(cls_id, "")).lower()
+
+        if not single_class_barrier_model and "barrier" not in class_name:
+            continue
+
+        conf = float(box.conf[0])
+        if conf < 0.4:
+            continue
+
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        box_area = (x2 - x1) * (y2 - y1)
+        if box_area / (sw * sh) < 0.001:
+            continue
+
+        det = {
+            "class": "boom_barrier",
+            "confidence": round(conf, 2),
+            "bbox": [x1, y1, x2, y2],
+        }
+        detections.append(estimate_risk(det, car_zone_mask, danger_zone_mask, sw, sh))
+
+    return detections
+
+
+def process_obstacles(frame_small, results, car_zone_mask, danger_zone_mask, extra_detections=None):
     """
     Filters YOLO results down to obstacles only,
     scores each one for risk, and returns the findings.
     """
     sh, sw = frame_small.shape[:2]
     boxes = results[0].boxes
-    detections = []
+    detections = list(extra_detections or [])
 
     for box in boxes:
         cls_id = int(box.cls[0])
@@ -488,6 +536,7 @@ def decide_driving_action(path_data, avoid_action, traffic_action):
 
 
 
+
 def read_traffic_light_state(frame, bbox):
     """
     Crops the traffic light and checks which bulb is lit
@@ -533,9 +582,7 @@ def read_traffic_light_state(frame, bbox):
     return best if scores[best] >= 0.05 else "unknown"
 
 
-# ─────────────────────────────────────────────────────────────
-# SPEED LIMIT SIGN READER
-# ─────────────────────────────────────────────────────────────
+
 
 def read_speed_limit(frame, bbox):
     """
@@ -545,6 +592,9 @@ def read_speed_limit(frame, bbox):
     We preprocess the crop (grayscale + threshold) to give OCR
     clean high-contrast input, which improves accuracy significantly.
     """
+    if pytesseract is None:
+        return None
+
     x1, y1, x2, y2 = bbox
     crop = frame[y1:y2, x1:x2]
 
@@ -575,6 +625,8 @@ def read_speed_limit(frame, bbox):
     return None
 
 
+
+
 def detect_school_sign(frame, bbox):
     """
     School ahead signs are typically bright yellow/fluorescent.
@@ -602,6 +654,7 @@ def detect_school_sign(frame, bbox):
 
     # If more than 30% of the region is warning yellow, treat as school sign
     return yellow_ratio > 0.30
+
 
 
 
@@ -677,10 +730,10 @@ def process_traffic(frame_small, results):
     }
 
 
-
 def annotate_frame(
     frame_small,
     results,
+    barrier_results,
     zone,
     obstacle_data,
     traffic_data,
@@ -700,6 +753,25 @@ def annotate_frame(
     """
     # Start with YOLO's own box drawing as the base
     annotated = results[0].plot()
+
+    # Draw boom barrier detections from the dedicated barrier model.
+    for barrier in extract_barrier_detections(
+        frame_small,
+        barrier_results,
+        np.zeros(frame_small.shape[:2], dtype=np.uint8),
+        np.zeros(frame_small.shape[:2], dtype=np.uint8),
+    ):
+        x1, y1, x2, y2 = barrier["bbox"]
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 80, 255), 2)
+        cv2.putText(
+            annotated,
+            f"boom_barrier {barrier['confidence']:.2f}",
+            (x1, max(y1 - 8, 15)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 80, 255),
+            2,
+        )
 
     # Draw detected road portion as a semi-transparent green overlay.
     road_overlay = np.zeros_like(annotated)
@@ -795,9 +867,9 @@ def process_frame_dl(frame, lane_offset=0):
     # Time the inference
     t0 = time.time()
 
-    # Run YOLO once — results are used by both obstacle and traffic processors
-    # Running it once instead of twice saves significant time
+    # Run COCO YOLO for normal road objects/signs and the fine-tuned model for barriers.
     results = model(frame_small, conf=0.4, verbose=False)
+    barrier_results = barrier_model(frame_small, conf=0.4, verbose=False)
 
     inference_ms = round((time.time() - t0) * 1000, 1)
 
@@ -808,8 +880,16 @@ def process_frame_dl(frame, lane_offset=0):
     road_data = detect_road_portion(frame_small)
     path_data = get_path_guidance(road_data["mask"], car_zone_bbox)
 
-    # Process obstacles and traffic from the same YOLO results
-    obstacle_data = process_obstacles(frame_small, results, car_zone_mask, danger_zone_mask)
+    barrier_detections = extract_barrier_detections(
+        frame_small, barrier_results, car_zone_mask, danger_zone_mask
+    )
+    obstacle_data = process_obstacles(
+        frame_small,
+        results,
+        car_zone_mask,
+        danger_zone_mask,
+        extra_detections=barrier_detections,
+    )
     traffic_data  = process_traffic(frame_small, results)
 
     # ── Combine into one final action ──
@@ -822,7 +902,7 @@ def process_frame_dl(frame, lane_offset=0):
 
     # Draw everything on the frame
     annotated = annotate_frame(
-        frame_small, results, zone,
+        frame_small, results, barrier_results, zone,
         obstacle_data, traffic_data, final_action, road_data,
         car_zone_bbox, danger_zone_mask, path_data
     )
@@ -865,8 +945,27 @@ if __name__ == "__main__":
         default=Path("outputs") / "segmentation" / "detector2_overlay.mp4",
         help="Output annotated video path",
     )
+    parser.add_argument(
+        "--coco-weights",
+        type=Path,
+        default=DEFAULT_COCO_MODEL_PATH,
+        help="YOLO weights for normal COCO classes.",
+    )
+    parser.add_argument(
+        "--barrier-weights",
+        "--weights",
+        dest="barrier_weights",
+        type=Path,
+        default=DEFAULT_BARRIER_MODEL_PATH,
+        help="Fine-tuned YOLO weights for boom barrier detection.",
+    )
     parser.add_argument("--no-display", action="store_true", help="Disable live preview window")
     args = parser.parse_args()
+
+    model = load_detection_model(args.coco_weights)
+    barrier_model = load_detection_model(args.barrier_weights)
+    print(f"Loaded COCO YOLO weights: {Path(args.coco_weights).expanduser().resolve()}")
+    print(f"Loaded barrier YOLO weights: {Path(args.barrier_weights).expanduser().resolve()}")
 
     cap = cv2.VideoCapture(str(args.video))
 
