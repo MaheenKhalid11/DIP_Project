@@ -101,13 +101,13 @@ def choose_avoid_action(obstacles: list, car_zone_bbox: list,
     Returns the avoidance action and the obstacle that caused it. Side checks
     use the road mask so the car does not steer into non-road space.
     """
-    # Only consider obstacles that are both in the path and risky enough.
-    risky = [o for o in obstacles if o["in_path"] and o["risk_score"] >= 0.35]
-    if not risky:
+    # Safety-first policy: any in-path obstacle means immediate stop.
+    in_path = [o for o in obstacles if o["in_path"]]
+    if not in_path:
         return "CLEAR", None
 
-    # Focus on the single most dangerous obstacle.
-    primary        = max(risky, key=lambda o: o["risk_score"])
+    # Keep returning the highest-risk in-path object for overlays/debug info.
+    primary        = max(in_path, key=lambda o: o["risk_score"])
     px1, _, px2, _ = primary["bbox"]
     obs_center     = 0.5 * (px1 + px2)
     cx1, _, cx2, _ = car_zone_bbox
@@ -124,23 +124,9 @@ def choose_avoid_action(obstacles: list, car_zone_bbox: list,
     right_free = (float(np.mean(slice_mask[:, int(car_center):] > 0))
                   if int(car_center) < w - 1 else 0.0)
 
-    # Immediate collision risk.
-    if primary["risk_score"] >= 0.75 or primary["car_overlap"] > 0.08:
-        return "STOP", primary
-
-    # Medium-high risk: try to steer around if there is road space.
-    if primary["risk_score"] >= 0.55:
-        if obs_center >= car_center and left_free > 0.08:
-            return "MOVE_LEFT", primary
-        if obs_center < car_center and right_free > 0.08:
-            return "MOVE_RIGHT", primary
-        return "SLOW_DOWN", primary
-
-    # Lower risk: slow down rather than making a hard steering move.
-    if primary["risk_score"] >= 0.35:
-        return "SLOW_DOWN", primary
-
-    return "CLEAR", primary
+    # Keep these values computed for debugging/telemetry compatibility.
+    _ = obs_center, left_free, right_free
+    return "STOP", primary
 
 
 def decide_final_action(path_data: dict, obstacle_data: dict,

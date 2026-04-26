@@ -142,6 +142,26 @@ def annotate(frame_small, coco_results, barrier_results, barrier_dets,
     # Start with YOLO's own box drawing.
     annotated = coco_results[0].plot()
 
+    def draw_label(img, text, x, y, text_color, bg_color=(0, 0, 0), alpha=0.65):
+        """Draw text with a semi-transparent background for readability."""
+        h, w = img.shape[:2]
+        x = int(np.clip(x, 0, max(w - 1, 0)))
+        y = int(np.clip(y, 16, max(h - 1, 16)))
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.52
+        thickness = 1
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+        x2 = min(w - 1, x + tw + 8)
+        y1 = max(0, y - th - 8)
+        y2 = min(h - 1, y + 4)
+
+        if x2 > x and y2 > y1:
+            roi = img[y1:y2, x:x2]
+            overlay = np.full_like(roi, bg_color, dtype=np.uint8)
+            cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, roi)
+
+        cv2.putText(img, text, (x + 4, y - 4), font, scale, text_color, thickness, cv2.LINE_AA)
+
     # The separate barrier model gets an orange box so it is easy to spot.
     for b in barrier_dets:
         x1, y1, x2, y2 = b["bbox"]
@@ -175,25 +195,28 @@ def annotate(frame_small, coco_results, barrier_results, barrier_dets,
         cv2.putText(annotated, "safety zone", (x, max(12, y - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 180, 255), 1)
 
-    # Per-obstacle risk labels.
+    # Per-obstacle labels: keep class + risk only to avoid clutter.
     for obs in obstacle_data["obstacles"]:
         x1, y1 = obs["bbox"][0], obs["bbox"][1]
-        label   = f"{obs['class']} | {obs['proximity']} | risk:{obs['risk_score']}"
-        color   = (0, 0, 255) if obs["in_path"] else (0, 200, 200)
-        cv2.putText(annotated, label, (x1, max(y1 - 10, 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+        label = f"{obs['class']}  r:{obs['risk_score']:.2f}"
+        if obs["in_path"]:
+            draw_label(annotated, label, x1, max(y1 - 8, 18), (255, 255, 255), (0, 0, 180))
+        else:
+            draw_label(annotated, label, x1, max(y1 - 8, 18), (255, 255, 255), (40, 120, 40))
 
     # Traffic signal labels.
     for tdet in traffic_data["traffic_detections"]:
         x1, y1     = tdet["bbox"][0], tdet["bbox"][1]
-        label_text = f"{tdet['state']} → {tdet['action']}"
+        label_text = f"{tdet['class']} -> {tdet['action']}"
         if tdet["detail"]:
             label_text += f" ({tdet['detail']})"
-        text_color = {"STOP": (0, 0, 255), "SLOW": (0, 165, 255),
-                      "GO": (0, 255, 0), "CAUTION": (0, 255, 255)}.get(
+        text_color = {"STOP": (255, 255, 255), "SLOW": (0, 0, 0),
+                      "GO": (0, 0, 0), "CAUTION": (0, 0, 0)}.get(
                       tdet["action"], (255, 255, 255))
-        cv2.putText(annotated, label_text, (x1, max(y1 - 25, 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
+        bg_color = {"STOP": (0, 0, 200), "SLOW": (0, 190, 255),
+                    "GO": (60, 220, 60), "CAUTION": (0, 220, 220)}.get(
+                    tdet["action"], (80, 80, 80))
+        draw_label(annotated, label_text, x1, max(y1 - 24, 18), text_color, bg_color)
 
     # Path offset info.
     cv2.putText(

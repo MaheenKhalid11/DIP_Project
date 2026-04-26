@@ -115,8 +115,8 @@ def estimate_risk(detection, car_zone_mask, danger_zone_mask, frame_width, frame
     detection["car_overlap"]  = round(car_overlap, 2)
     detection["risk_score"]   = risk_score
     detection["proximity"]    = proximity
-    # Treat it as in-path only when overlap is large enough to matter.
-    detection["in_path"]      = (danger_overlap > 0.15) or (car_overlap > 0.05)
+    # Slightly more sensitive in-path trigger to react a bit earlier.
+    detection["in_path"]      = (danger_overlap > 0.10) or (car_overlap > 0.03)
 
     return detection
 
