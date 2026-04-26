@@ -8,7 +8,6 @@ summaries, then chooses one final action for the current frame.
 import numpy as np
 from collections import deque
 
-# Rolling window for steering offset. It removes small frame-to-frame jumps
 # from the segmentation mask without adding much delay.
 _path_offset_history: deque = deque(maxlen=7)
 
@@ -101,32 +100,33 @@ def choose_avoid_action(obstacles: list, car_zone_bbox: list,
     Returns the avoidance action and the obstacle that caused it. Side checks
     use the road mask so the car does not steer into non-road space.
     """
-    # Safety-first policy: any in-path obstacle means immediate stop.
+    h, w = road_mask.shape[:2]
+    cx1, cy1, cx2, _ = car_zone_bbox
+    car_center = 0.5 * (cx1 + cx2)
+
+    # 1) Hard blockers from mask overlap.
     in_path = [o for o in obstacles if o["in_path"]]
-    if not in_path:
+    if in_path:
+        primary = max(in_path, key=lambda o: o["risk_score"])
+        return "STOP", primary
+
+    # 2) Fallback: visually front-center blockers (even if mask overlap misses).
+    front_candidates = []
+    for o in obstacles:
+        x1, y1, x2, y2 = o["bbox"]
+        obs_center = 0.5 * (x1 + x2)
+        center_dist = abs(obs_center - car_center) / max(w, 1)
+        in_front_band = (y2 >= int(0.40 * h)) and (y1 <= cy1 + int(0.08 * h))
+        near_lane_center = center_dist <= 0.24
+        if in_front_band and near_lane_center and o["risk_score"] >= 0.20:
+            front_candidates.append(o)
+
+    if not front_candidates:
         return "CLEAR", None
 
-    # Keep returning the highest-risk in-path object for overlays/debug info.
-    primary        = max(in_path, key=lambda o: o["risk_score"])
-    px1, _, px2, _ = primary["bbox"]
-    obs_center     = 0.5 * (px1 + px2)
-    cx1, _, cx2, _ = car_zone_bbox
-    car_center     = 0.5 * (cx1 + cx2)
-
-    # Check road availability on each side near the bottom of the frame.
-    h, w       = road_mask.shape[:2]
-    y_top      = max(0, int(0.55 * h))
-    y_bottom   = min(h, int(0.90 * h))
-    slice_mask = road_mask[y_top:y_bottom, :]
-
-    left_free  = (float(np.mean(slice_mask[:, :int(car_center)] > 0))
-                  if int(car_center) > 1 else 0.0)
-    right_free = (float(np.mean(slice_mask[:, int(car_center):] > 0))
-                  if int(car_center) < w - 1 else 0.0)
-
-    # Keep these values computed for debugging/telemetry compatibility.
-    _ = obs_center, left_free, right_free
-    return "STOP", primary
+    primary = max(front_candidates, key=lambda o: (o["risk_score"], o["bbox"][3]))
+    # If the object is very close in image space, stop; otherwise slow down.
+    return ("STOP", primary) if primary["bbox"][3] >= int(0.58 * h) else ("SLOW_DOWN", primary)
 
 
 def decide_final_action(path_data: dict, obstacle_data: dict,

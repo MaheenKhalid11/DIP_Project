@@ -21,7 +21,7 @@ from decision import get_path_guidance, decide_final_action
 
 # Basic settings. Update the paths before running on a new machine/video.
 
-VIDEO_PATH          = "/Users/musfiraaslam/Documents/GitHub/Dip-Muh/DIP_Project/deep_learning/videos/PXL_20250325_043922504.TS.mp4"        # set your video path here
+VIDEO_PATH          = "/Users/musfiraaslam/Documents/GitHub/Dip-Muh/DIP_Project/deep_learning/videos/trimmed2.mp4"        # set your video path here
 COCO_WEIGHTS        = "models/yolov8n.pt"
 BARRIER_WEIGHTS     = "models/boom_barrier_best.pt"
 CAR_ICON_PATH       = "assets/images/car.png"  # set to None if you have no icon

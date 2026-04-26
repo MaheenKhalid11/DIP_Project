@@ -101,22 +101,28 @@ def estimate_risk(detection, car_zone_mask, danger_zone_mask, frame_width, frame
     bottom_y_ratio = y2 / frame_height
     box_area_ratio = ((x2 - x1) * (y2 - y1)) / (frame_width * frame_height)
 
+    bbox_center_x = ((x1 + x2) * 0.5) / max(frame_width, 1)
+    lane_center_bonus = 0.12 if abs(bbox_center_x - 0.5) <= 0.22 else 0.0
+
     risk_score = (
-        danger_overlap * 0.50
-        + car_overlap  * 0.25
+        danger_overlap * 0.40
+        + car_overlap  * 0.35
         + bottom_y_ratio * 0.15
         + min(box_area_ratio * 10, 1.0) * 0.10
+        + lane_center_bonus
     )
-    risk_score = round(min(risk_score, 1.0), 2)
 
+    # Slightly more sensitive in-path trigger to react a bit earlier.
+    detection["in_path"] = (danger_overlap > 0.10) or (car_overlap > 0.03)
+    if detection["in_path"]:
+        risk_score = max(risk_score, 0.35)
+    risk_score = round(min(risk_score, 1.0), 2)
     proximity = "NEAR" if risk_score > 0.65 else "MEDIUM" if risk_score > 0.35 else "FAR"
 
     detection["path_overlap"] = round(danger_overlap, 2)
     detection["car_overlap"]  = round(car_overlap, 2)
     detection["risk_score"]   = risk_score
     detection["proximity"]    = proximity
-    # Slightly more sensitive in-path trigger to react a bit earlier.
-    detection["in_path"]      = (danger_overlap > 0.10) or (car_overlap > 0.03)
 
     return detection
 
