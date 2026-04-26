@@ -1,0 +1,12 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+env/
+
+
+# Output 
+outputs/

@@ -1,33 +1,10 @@
 """
-yolo_detection.py
-─────────────────
-Responsibility: run YOLO inference and turn raw bounding boxes into
-structured, risk-scored detections.
+YOLO detection and risk scoring.
 
-This file answers two questions:
-    1. What objects are in the frame, and how dangerous are they?
-    2. Are there any traffic control signals we need to obey?
-
-It does NOT make final driving decisions — that is decision.py's job.
-
-Public API
-──────────
-    detector = YOLODetector(coco_weights, barrier_weights)
-
-    result = detector.process_frame(frame_small, car_zone_mask, danger_zone_mask)
-
-    result keys
-        "obstacles"         – list of obstacle dicts with risk scores
-        "obstacle_in_path"  – smoothed bool
-        "closest_obstacle"  – highest-risk in-path obstacle (or None)
-        "stable_risk"       – smoothed float 0-1
-        "obstacle_action"   – "STOP" / "SLOW" / "CLEAR"
-        "traffic_detections"– list of traffic control dicts
-        "traffic_action"    – "STOP" / "SLOW" / "GO" / "CAUTION"
-        "inference_time_ms" – wall-clock ms for both YOLO passes
+This module wraps the general COCO model and the custom barrier model, then
+turns their boxes into the obstacle and traffic summaries used by decision.py.
 """
 
-import re
 import time
 from collections import deque
 from pathlib import Path
@@ -35,23 +12,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-try:
-    import pytesseract
-    # Windows users: uncomment and set this path
-    # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-    _TESSERACT_OK = True
-except ImportError:
-    pytesseract = None
-    _TESSERACT_OK = False
-
 from ultralytics import YOLO
 
 
-# ──────────────────────────────────────────────────────────────
-# CONSTANTS
-# ──────────────────────────────────────────────────────────────
-
-# COCO class IDs relevant to road driving
+# COCO class IDs that matter for this project.
 OBSTACLE_CLASSES = {
     0:  "person",
     1:  "bicycle",
@@ -59,17 +23,16 @@ OBSTACLE_CLASSES = {
     3:  "motorcycle",
     5:  "bus",
     7:  "truck",
-    58: "potted plant",   # large flower-pot obstacles on campus
+    58: "potted plant",   # common campus obstacle
 }
 
-# COCO classes for traffic control (lights + signs)
+# Traffic-control classes available in COCO.
 TRAFFIC_CLASSES = {
     9:  "traffic_light",
     11: "stop_sign",
 }
 
-# Priority used when combining actions from multiple detections
-# Higher number = more urgent
+# Higher number wins when multiple traffic detections disagree.
 ACTION_PRIORITY = {
     "STOP":    4,
     "SLOW":    3,
@@ -79,21 +42,12 @@ ACTION_PRIORITY = {
 }
 
 
-# ──────────────────────────────────────────────────────────────
-# TEMPORAL SMOOTHER
-# ──────────────────────────────────────────────────────────────
-
 class DetectionSmoother:
     """
-    Reduces frame-to-frame flickering in obstacle decisions.
+    Smooth obstacle decisions over a short frame window.
 
-    Raw YOLO output can vary slightly each frame due to lighting changes,
-    motion blur, and NMS randomness.  Instead of reacting instantly, we
-    keep a short history and require a majority vote before declaring an
-    obstacle "in path".
-
-    For 30 fps video, window=5 → ~167 ms of lag — acceptable for
-    low-speed campus driving.
+    YOLO boxes can flicker under blur or lighting changes. A short majority
+    vote keeps the decision from changing on every single noisy frame.
     """
     def __init__(self, window: int = 5):
         self.history: deque = deque(maxlen=window)
@@ -110,20 +64,15 @@ class DetectionSmoother:
         return stable_flag, round(avg_risk, 2)
 
 
-# ──────────────────────────────────────────────────────────────
-# RISK ESTIMATION
-# ──────────────────────────────────────────────────────────────
-
 def _bbox_zone_overlap(bbox, zone_mask, frame_width, frame_height):
     """
-    Fraction of a bounding box that overlaps a binary zone mask.
+    Return how much of a bounding box overlaps a binary mask.
 
-    We crop the pre-built mask to the bbox region and count white pixels.
-    This is fast (no polygon math per-call) because the masks are built
-    once per frame in main.py.
+    The masks are already built for the frame, so this is just a crop and a
+    white-pixel count.
     """
     x1, y1, x2, y2 = bbox
-    # Clamp to valid frame coordinates
+    # Clamp to valid frame coordinates.
     x1 = max(0, min(frame_width  - 1, x1))
     x2 = max(0, min(frame_width,      x2))
     y1 = max(0, min(frame_height - 1, y1))
@@ -139,16 +88,11 @@ def _bbox_zone_overlap(bbox, zone_mask, frame_width, frame_height):
 
 def estimate_risk(detection, car_zone_mask, danger_zone_mask, frame_width, frame_height):
     """
-    Assigns a risk score (0.0 → 1.0) using monocular visual cues.
+    Assign a risk score from 0.0 to 1.0 using image-only cues.
 
-    We have no depth sensor, so we approximate distance from the image:
-
-    car_overlap   – object overlaps the car's own footprint (immediate collision)
-    danger_overlap – object in the expanded safety zone around the car
-    bottom_y      – lower in frame = physically closer (perspective geometry)
-    box_area      – larger box = closer object (perspective scaling)
-
-    Weights chosen so that spatial overlap dominates over size heuristics.
+    Direct overlap with the car area matters most, followed by overlap with
+    the wider safety zone. Box size and vertical position are used as rough
+    distance hints because there is no depth sensor.
     """
     x1, y1, x2, y2 = detection["bbox"]
 
@@ -171,106 +115,18 @@ def estimate_risk(detection, car_zone_mask, danger_zone_mask, frame_width, frame
     detection["car_overlap"]  = round(car_overlap, 2)
     detection["risk_score"]   = risk_score
     detection["proximity"]    = proximity
-    # An obstacle is "in path" if it meaningfully overlaps the danger or car zone
+    # Treat it as in-path only when overlap is large enough to matter.
     detection["in_path"]      = (danger_overlap > 0.15) or (car_overlap > 0.05)
 
     return detection
 
 
-# ──────────────────────────────────────────────────────────────
-# TRAFFIC LIGHT + SIGN HELPERS
-# ──────────────────────────────────────────────────────────────
-
-def _read_traffic_light_state(frame, bbox):
-    """
-    Determines the lit colour of a traffic light bounding box crop.
-
-    Why HSV instead of BGR:
-    BGR mixes colour and brightness so the same red looks different in
-    shadow vs sunlight.  HSV separates Hue (colour) from Value (brightness),
-    making thresholds robust to outdoor lighting variation.
-
-    Why split into thirds:
-    Traffic lights always follow RED-top / YELLOW-middle / GREEN-bottom
-    internationally.  Checking each third independently is more reliable
-    than asking "what colour is brightest overall?"
-
-    Why two red masks:
-    In OpenCV HSV the hue wheel runs 0–179.  Red sits at both ends (0–10
-    and 160–179) so we need two ranges merged with bitwise OR.
-    """
-    x1, y1, x2, y2 = bbox
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return "unknown"
-
-    crop = cv2.resize(crop, (30, 90))   # tall narrow — matches light shape
-    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    h    = crop.shape[0]
-
-    top    = hsv[0     : h//3,   :]   # red bulb region
-    middle = hsv[h//3  : 2*h//3, :]   # yellow bulb region
-    bottom = hsv[2*h//3: h,      :]   # green bulb region
-
-    r1         = cv2.inRange(top, np.array([0,   100, 100]), np.array([10,  255, 255]))
-    r2         = cv2.inRange(top, np.array([160, 100, 100]), np.array([179, 255, 255]))
-    red_score  = np.sum(cv2.bitwise_or(r1, r2) > 0) / top.size
-
-    ym         = cv2.inRange(middle, np.array([20, 100, 100]), np.array([35, 255, 255]))
-    yel_score  = np.sum(ym > 0) / middle.size
-
-    gm         = cv2.inRange(bottom, np.array([40, 50, 50]),  np.array([90, 255, 255]))
-    grn_score  = np.sum(gm > 0) / bottom.size
-
-    scores = {"red": red_score, "yellow": yel_score, "green": grn_score}
-    best   = max(scores, key=scores.get)
-
-    # Require a minimum score to avoid false readings on dark/blurry crops
-    return best if scores[best] >= 0.05 else "unknown"
-
-
-def _read_speed_limit(frame, bbox):
-    """
-    Uses OCR (Optical Character Recognition) to read a number from a
-    speed-limit sign crop.
-
-    Preprocessing steps:
-      Enlarge → grayscale → binary threshold
-    Each step makes the text cleaner for Tesseract to parse.
-
-    Returns an integer speed limit, or None if unreadable.
-    """
-    if not _TESSERACT_OK:
-        return None
-
-    x1, y1, x2, y2 = bbox
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return None
-
-    crop  = cv2.resize(crop, (120, 120))
-    gray  = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    _, th = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)
-
-    # psm 7 = single line of text; whitelist = digits only
-    cfg  = "--psm 7 -c tessedit_char_whitelist=0123456789"
-    text = pytesseract.image_to_string(th, config=cfg).strip()
-    nums = re.findall(r'\d+', text)
-    if nums:
-        limit = int(nums[0])
-        if 5 <= limit <= 130:
-            return limit
-    return None
-
-
 def _detect_school_sign(frame, bbox):
     """
-    Checks whether a detected sign region is fluorescent yellow —
-    the distinctive colour of school/warning signs.
+    Check whether a sign crop looks like a yellow school/warning sign.
 
-    YOLO has no "school sign" class, so we use a classical HSV colour
-    threshold on the crop.  This is a heuristic, not a classifier, but
-    it is fast and interpretable.
+    This is only a colour heuristic because the COCO model has no separate
+    school-sign class.
     """
     x1, y1, x2, y2 = bbox
     crop = frame[y1:y2, x1:x2]
@@ -282,24 +138,16 @@ def _detect_school_sign(frame, bbox):
     return float(np.sum(yellow_mask > 0) / yellow_mask.size) > 0.30
 
 
-# ──────────────────────────────────────────────────────────────
-# MAIN DETECTOR CLASS
-# ──────────────────────────────────────────────────────────────
-
 class YOLODetector:
     """
-    Wraps two YOLO models (general COCO + fine-tuned boom barrier) and
-    exposes a single process_frame() call.
+    Wrap the general COCO model plus the custom boom-barrier model.
 
-    Two separate models because:
-    - The COCO model covers people, cars, bikes, flower pots, etc.
-    - The barrier model is fine-tuned for our specific campus barrier,
-      which the general model does not reliably detect.
-    Both run on the same resized frame so total overhead is ~2× single.
+    COCO handles common road objects and traffic signals. The second model is
+    kept separate because the campus barrier is not detected reliably by COCO.
     """
 
-    def __init__(self, coco_weights: str = "yolov8n.pt",
-                 barrier_weights: str = "boom_barrier_best.pt"):
+    def __init__(self, coco_weights: str = "models/yolov8n.pt",
+                 barrier_weights: str = "models/boom_barrier_best.pt"):
         coco_path    = Path(coco_weights).expanduser().resolve()
         barrier_path = Path(barrier_weights).expanduser().resolve()
 
@@ -312,7 +160,7 @@ class YOLODetector:
         self.barrier_model = YOLO(str(barrier_path))
         self.smoother      = DetectionSmoother(window=5)
 
-        # Detect whether the barrier model is single-class (always barrier)
+        # Some trained barrier models are single-class, others keep class names.
         barrier_names = getattr(self.barrier_model, "names", {}) or {}
         self._barrier_single_class = len(barrier_names) == 1
 
@@ -320,11 +168,9 @@ class YOLODetector:
         print(f"[YOLODetector] Barrier model: {barrier_path.name}"
               f"  (single-class={self._barrier_single_class})")
 
-    # ── internal helpers ──────────────────────────────────────
-
     def _extract_barriers(self, frame_small, barrier_results,
                           car_zone_mask, danger_zone_mask):
-        """Converts barrier model detections into the standard obstacle dict format."""
+        """Convert barrier detections into the standard obstacle format."""
         sh, sw     = frame_small.shape[:2]
         detections = []
         names      = (getattr(barrier_results[0], "names", {})
@@ -334,7 +180,7 @@ class YOLODetector:
             cls_id     = int(box.cls[0])
             class_name = str(names.get(cls_id, "")).lower()
 
-            # For multi-class barrier models keep only barrier detections
+            # Multi-class barrier models may include non-barrier labels.
             if not self._barrier_single_class and "barrier" not in class_name:
                 continue
 
@@ -344,7 +190,7 @@ class YOLODetector:
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             if (x2 - x1) * (y2 - y1) / (sw * sh) < 0.001:
-                continue    # skip tiny noise
+                continue    # tiny noise
 
             det = {
                 "class":      "boom_barrier",
@@ -360,8 +206,10 @@ class YOLODetector:
                            car_zone_mask, danger_zone_mask,
                            extra_detections):
         """
-        Filters COCO detections to road-relevant classes, scores each,
-        merges barrier detections, and returns the obstacle summary.
+        Filter COCO detections to road-relevant classes and score each one.
+
+        Barrier detections are passed in separately and merged here so the
+        rest of the pipeline sees one obstacle list.
         """
         sh, sw     = frame_small.shape[:2]
         detections = list(extra_detections)
@@ -377,7 +225,7 @@ class YOLODetector:
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             if (x2 - x1) * (y2 - y1) / (sw * sh) < 0.005:
-                continue    # discard tiny/distant noise
+                continue    # tiny or very distant noise
 
             det = {
                 "class":      OBSTACLE_CLASSES[cls_id],
@@ -390,7 +238,7 @@ class YOLODetector:
         in_path = [d for d in detections if d["in_path"]]
         closest = max(in_path, key=lambda d: d["risk_score"]) if in_path else None
 
-        # Update smoother and get stable (flicker-free) result
+        # Smooth the in-path decision before choosing an obstacle action.
         self.smoother.update(bool(in_path), closest["risk_score"] if closest else 0.0)
         stable_flag, stable_risk = self.smoother.get_stable()
 
@@ -411,9 +259,10 @@ class YOLODetector:
 
     def _process_traffic(self, frame_small, coco_results):
         """
-        Scans COCO detections for traffic lights and signs.
-        Runs sub-analysis (colour read / OCR / school-sign heuristic)
-        for each and returns the most urgent traffic action.
+        Look for traffic-control detections and return the strongest action.
+
+        Stop signs are direct STOPs. Traffic lights are treated conservatively
+        because colour-state parsing is disabled.
         """
         detections = []
 
@@ -436,10 +285,8 @@ class YOLODetector:
             }
 
             if label == "traffic_light":
-                state       = _read_traffic_light_state(frame_small, [x1, y1, x2, y2])
-                det["state"]  = state
-                det["action"] = {"red": "STOP", "yellow": "SLOW",
-                                 "green": "GO"}.get(state, "CAUTION")
+                det["state"]  = "traffic_light"
+                det["action"] = "CAUTION"
 
             elif label == "stop_sign":
                 det["state"]  = "stop"
@@ -450,15 +297,9 @@ class YOLODetector:
                     det["action"] = "SLOW"
                     det["detail"] = "School zone"
 
-                limit = _read_speed_limit(frame_small, [x1, y1, x2, y2])
-                if limit:
-                    det["state"]  = "speed_limit"
-                    det["action"] = "SLOW"
-                    det["detail"] = f"{limit} km/h"
-
             detections.append(det)
 
-        # Pick the single most urgent traffic action
+        # Pick the most urgent traffic action.
         traffic_action = "GO"
         for d in detections:
             if ACTION_PRIORITY.get(d["action"], 0) > ACTION_PRIORITY.get(traffic_action, 0):
@@ -469,30 +310,23 @@ class YOLODetector:
             "traffic_action":     traffic_action,
         }
 
-    # ── public API ────────────────────────────────────────────
-
     def process_frame(self, frame_small, car_zone_mask, danger_zone_mask):
         """
-        Runs both YOLO models on frame_small and returns a combined result.
+        Run both YOLO models on the resized frame and combine their results.
 
-        frame_small     – already-resized BGR frame (e.g. 640×360)
-        car_zone_mask   – binary mask matching the car icon footprint
-        danger_zone_mask – dilated version of car_zone_mask
-
-        Important: both YOLO calls happen here (not in two places).
-        COCO results feed both obstacle and traffic processors,
-        so inference runs only once for COCO.
+        COCO inference is shared by obstacle and traffic processing, so the
+        general model runs only once per frame.
         """
         t0 = time.time()
 
-        # Run COCO model once — reused by both obstacle and traffic processors
+        # COCO is reused by both obstacle and traffic processors.
         coco_results    = self.coco_model(frame_small,    conf=0.4, verbose=False)
-        # Run fine-tuned barrier model separately
+        # The fine-tuned barrier model runs separately.
         barrier_results = self.barrier_model(frame_small, conf=0.4, verbose=False)
 
         inference_ms = round((time.time() - t0) * 1000, 1)
 
-        # Extract barrier detections first so they can be merged into obstacles
+        # Convert raw detections into the dictionaries used downstream.
         barrier_dets  = self._extract_barriers(
             frame_small, barrier_results, car_zone_mask, danger_zone_mask
         )
