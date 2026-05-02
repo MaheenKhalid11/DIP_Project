@@ -18,10 +18,7 @@ from segmentation import color_segmentation
 from yolo_detection import YOLODetector, estimate_risk
 from decision import get_path_guidance, decide_final_action
 
-
-# Basic settings. Update the paths before running on a new machine/video.
-
-VIDEO_PATH          = "/Users/musfiraaslam/Documents/GitHub/Dip-Muh/DIP_Project/deep_learning/videos/trimmed2.mp4"        # set your video path here
+VIDEO_PATH          = "/Users/musfiraaslam/Documents/GitHub/Dip-Muh/Faster/WhatsApp Video 2026-05-02 at 14.30.32.mp4"        # set your video path here
 COCO_WEIGHTS        = "models/yolov8n.pt"
 BARRIER_WEIGHTS     = "models/boom_barrier_best.pt"
 CAR_ICON_PATH       = "assets/images/car.png"  # set to None if you have no icon
@@ -29,6 +26,8 @@ OUTPUT_VIDEO_PATH   = "outputs/result.mp4"    # set to None to skip saving
 SHOW_DISPLAY        = True                    # set False for headless runs
 FRAME_WIDTH         = 640
 FRAME_HEIGHT        = 360
+USE_CAMERA_DEFAULT  = True                    # False to start from VIDEO_PATH instead
+CAMERA_INDEX        = 0
 
 def _load_car_icon(path):
     """Load the optional car overlay image."""
@@ -226,13 +225,15 @@ def annotate(frame_small, coco_results, barrier_results, barrier_dets,
     )
 
     # Final action banner.
-    banner_color = {
-        "STOP":       (0,   0,   255),
-        "SLOW_DOWN":  (0,   165, 255),
-        "FORWARD":    (0,   255, 0),
-        "MOVE_LEFT":  (255, 220, 0),
-        "MOVE_RIGHT": (255, 220, 0),
-    }.get(final_action, (255, 255, 255))
+    action_colors = {
+    "FORWARD":    (0, 200, 0),      # green
+    "STOP":       (0, 0, 220),      # red
+    "SLOW_DOWN":  (0, 165, 255),    # orange
+    "MOVE_LEFT":  (255, 180, 0),    # cyan
+    "MOVE_RIGHT": (255, 180, 0),    # cyan
+    "BACKWARD":   (180, 0, 255),    # purple
+    }
+    banner_color = action_colors.get(final_action, (100, 100, 100))
 
     cv2.rectangle(annotated, (0, 0), (320, 55), (0, 0, 0), -1)
     cv2.putText(annotated, f"ACTION: {final_action}",
@@ -323,16 +324,32 @@ class FramePipeline:
         self._pool.shutdown(wait=True, cancel_futures=True)
 
 
+def _open_capture(use_camera: bool):
+    """Open either the configured camera index or the video file path."""
+    if use_camera:
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            print(f"Error: could not open camera index {CAMERA_INDEX}")
+            print("Press V to fall back to the video source.")
+            return None, "camera"
+        return cap, "camera"
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        print(f"Error: could not open video at '{VIDEO_PATH}'")
+        print("Check that the path is correct and the file exists.")
+        return None, "video"
+    return cap, "video"
+
+
 def main():
     # Load assets.
     car_icon = _load_car_icon(CAR_ICON_PATH)
     detector = YOLODetector(COCO_WEIGHTS, BARRIER_WEIGHTS)
 
-    # Open input video.
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        print(f"Error: could not open video at '{VIDEO_PATH}'")
-        print("Check that the path is correct and the file exists.")
+    use_camera = USE_CAMERA_DEFAULT
+    cap, source_name = _open_capture(use_camera)
+    if cap is None:
         return
 
     video_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -360,15 +377,18 @@ def main():
     # Start the worker pipeline.
     pipeline = FramePipeline(detector, car_mask, danger_mask, road_smoother)
 
-    print("Running — press Q to quit\n")
+    print("Running — press Q to quit | C: camera index 1 | V: video file\n")
     frame_count  = 0
     total_ms     = 0.0
 
     while True:
         ret, raw_frame = cap.read()
         if not ret:
-            print("\nVideo finished.")
-            break
+            if source_name == "video":
+                print("\nVideo finished.")
+                break
+            print("\nWarning: camera frame read failed; retrying...")
+            continue
 
         # Resize to the working resolution used by all masks.
         frame_small = cv2.resize(raw_frame, (FRAME_WIDTH, FRAME_HEIGHT))
@@ -419,6 +439,15 @@ def main():
             car_icon        = car_icon,
             inference_ms    = det_result["inference_time_ms"],
         )
+        action_display = {
+       "FORWARD":    "↑ FORWARD",
+       "STOP":       "✖ STOP",
+       "SLOW_DOWN":  "↓ SLOW DOWN",
+       "MOVE_LEFT":  "← MOVE LEFT",
+       "MOVE_RIGHT": "→ MOVE RIGHT",
+       "BACKWARD":   "↓ BACKWARD",
+        }.get(final_action, final_action)
+
 
         # Keep terminal output to one updating line.
         avg_fps = 1000.0 / (total_ms / frame_count)
@@ -439,9 +468,28 @@ def main():
 
         if SHOW_DISPLAY:
             cv2.imshow("Self-Driving Pipeline", annotated)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 print("\nStopped by user.")
                 break
+            if key == ord("c") and source_name != "camera":
+                new_cap, new_source = _open_capture(True)
+                if new_cap is not None:
+                    cap.release()
+                    cap = new_cap
+                    source_name = new_source
+                    print(f"\nSwitched to camera index {CAMERA_INDEX}.")
+                else:
+                    print("\nStayed on current source.")
+            if key == ord("v") and source_name != "video":
+                new_cap, new_source = _open_capture(False)
+                if new_cap is not None:
+                    cap.release()
+                    cap = new_cap
+                    source_name = new_source
+                    print(f"\nSwitched to video: {VIDEO_PATH}")
+                else:
+                    print("\nStayed on current source.")
 
     # Cleanup.
     pipeline.stop()
