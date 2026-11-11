@@ -95,9 +95,3 @@ python segmentation.py road.jpg --show
 - **Car icon + outline:** ego vehicle and its safety zone
 - **Coloured labels:** obstacles with proximity and risk score
 - **Top banner:** final driving action for the frame
-
-## 👥 Contributors
-
-- [Maheen Khalid](https://github.com/MaheenKhalid11)
-- [Muhammad](https://github.com/Muhammad-135)
-- [Musfira Aslam](https://github.com/musfirakhan)
